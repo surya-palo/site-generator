@@ -81,6 +81,51 @@ random seeds, same-machine in-process timing of `run()` on 3 cases each):
 | 6 | 156.6 ms | 541.2 ms | 3.46x |
 | 7 | 168.1 ms | 558.8 ms | 3.32x |
 
+## Speedup round 2 (2026-11-23, after the first submission)
+
+Four further optimisations, each A/B'd on the practice set and re-validated
+(practice 3/3, edge cases, differential fuzz):
+
+1. **Inline escaping folded into the regex scan** (`944b3b7`). The inline
+   scanner's regex now also matches the five escapable characters, so a
+   plain run between matches holds no escapable character and is appended
+   raw instead of through `escapeHtml` per run. 144.7 → 126.5 ms median
+   (1.144x). (The first regex written for this accidentally matched `]`
+   too and produced bogus links; fixed by removing the stray `\]` from the
+   character class and verified against the fuzz set.)
+2. **CRLF fast path, per-directory link cache, no redundant toc copy**
+   (`a8ddfa8`). Sources without a CR skip the line-ending regex; link
+   resolutions are cached per (directory, relative target) in a nested
+   Map so a lookup builds no key string; the page record reuses the toc
+   objects instead of mapping them to fresh ones. A wash on median/mean,
+   but the minimums consistently favoured the new version.
+3. **slugify via C++ lowercasing and regex folding** (`1cfbe6d`). The JS
+   character loop is replaced by `toLowerCase().replace(/[^a-z0-9]+/g,
+   '-')` (non-ASCII text is still NFKD-normalised first, exactly as
+   before). 1.5x faster per call on a micro-benchmark of real
+   titles/tags/headings, 0 diffs; a wash on the full run because most
+   slugify calls hit the per-case cache.
+4. **Range-based Markdown rendering** (`162a29e`). `renderMarkdown` now
+   walks (start, end) ranges in the source with `indexOf('\n')`,
+   classifying lines by `charCodeAt` without building a per-line string
+   for lines it only classifies; the `split` and the lines array are
+   gone. The list-continuation check is a small `charCodeAt` scan (two
+   spaces, then a non-whitespace character) instead of a regex test.
+   120.9 → 118.7 ms median (1.019x).
+
+Practice set after round 2, 25 interleaved rounds, same machine,
+Node 24.22.1:
+
+| | median | mean | min |
+|---|---|---|---|
+| reference (makefun-site 1.0.0) | 498.3 ms | 523.1 ms | 475.3 ms |
+| this entry | 116.6 ms | 123.3 ms | 112.9 ms |
+| **speedup** | **4.27x** | **4.24x** | **4.21x** |
+
+Differential fuzz after round 2 (fresh seeds, 42 cases, 0 mismatches):
+4.00–4.02x. Practice 3/3 identical, hand-built edge cases identical,
+determinism 2x byte-identical.
+
 ## Correctness tests
 
 - **Practice set: 3/3 cases identical** to the oracle (`practice/reference/expected.json`).
@@ -114,7 +159,24 @@ random seeds, same-machine in-process timing of `run()` on 3 cases each):
   cost ate the render saving. Reverted to the node-walking renderer.
 - **Merging HTML escaping into the inline scan** (nine character checks per
   character, entities written directly): slightly slower than one regex
-  escape per plain run. Reverted.
+  escape per plain run. Reverted. (Note: folding escaping into the C++
+  regex scan, done in round 2, is different from per-character JS checks
+  and did win.)
+- **Null-prototype lookup optimisation** (round 2): replacing
+  `Object.hasOwn` in `lookup()` with direct property access on
+  prototype-free objects. 2–3x faster in an isolated micro-benchmark, but
+  0.938x median on the full run — building objects via
+  `Object.create(null)` plus sequential assignments costs more (hidden-
+  class transitions) than the literal plus `hasOwn` it replaced. Reverted.
+- **wordsOf regex variants** (round 2): char scan 332.7 ms vs `/\S+/g`
+  exec-loop 638.9 ms vs `.match(/\S+/g)` 556.1 ms per 20 rounds over all
+  1,070 practice bodies. The char scan stays.
+- **inline() array+join vs `+=`** (round 2): array+join 372.0 ms vs `+=`
+  228.7 ms per 10 rounds over 13,390 real paragraphs. `+=` stays (V8 cons
+  strings are lazy).
+- **resolvePath fast path** (round 2): clean relative targets joined
+  directly without split/join. Only 16% of real link targets are clean,
+  and the micro-benchmark showed no gain. Not adopted.
 
 ## History
 
@@ -124,3 +186,7 @@ random seeds, same-machine in-process timing of `run()` on 3 cases each):
   no-escape fast path for numbers/booleans in templates.
 - Optimisation 2: regex-scan inline rendering (measured ~11% faster than
   the per-character loop).
+- Speedup round 2 (2026-11-23): inline escaping folded into the regex
+  scan; CRLF fast path + per-directory link cache + no redundant toc copy;
+  slugify via C++ lowercasing and regex folding; range-based Markdown
+  rendering. 3.27x → **4.27x** median on the practice set.
